@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Quick script to create the repo, files, zip it, and optionally push to Heroku.
+# Edit the variables below before running or export them in your environment.
+# Usage:
+#   1) make this executable: chmod +x create-repo-and-deploy.sh
+#   2) run: ./create-repo-and-deploy.sh
+#   3) To auto-deploy to Heroku set HEROKU_APP and HEROKU_API_KEY environment variables beforehand.
+
+REPO_DIR="football-bot"
+ZIP_NAME="football-bot.zip"
+
+# Optional Heroku settings (leave empty to skip Heroku steps)
+HEROKU_APP="${HEROKU_APP:-}"        # e.g. my-football-bot-app
+HEROKU_API_KEY="${HEROKU_API_KEY:-}" # If set, will configure Heroku CLI for push
+GIT_REMOTE="${HEROKU_APP}"          # if HEROKU_APP set, use as remote name
+
+# Replace this token with your Telegram token or set TELEGRAM_BOT_TOKEN env var before running
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-YOUR_TELEGRAM_BOT_TOKEN_PLACEHOLDER}"
+
+# Ensure required commands exist
+for cmd in git zip python3 sed awk; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Required command not found: $cmd" >&2
+    exit 1
+  fi
+done
+
+# Remove any existing directory
+rm -rf "$REPO_DIR" "$ZIP_NAME"
+mkdir -p "$REPO_DIR"
+
+cat > "$REPO_DIR/Procfile" <<'EOF'
+web: uvicorn pred_service.app:app --host=0.0.0.0 --port=${PORT:-8000}
+worker: python collectors/simple_collector.py
+bot: python bot/app.py
+EOF
+
+cat > "$REPO_DIR/runtime.txt" <<'EOF'
+python-3.10.15
+EOF
+
+cat > "$REPO_DIR/requirements.txt" <<'EOF'
+fastapi
+uvicorn[standard]
+aiogram==2.25.1
+aiohttp
+redis
+psycopg2-binary
+joblib
+numpy
+pandas
+scikit-learn
+python-dotenv
+EOF
+
+cat > "$REPO_DIR/.env.example" <<EOF
+TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+REDIS_URL=redis://localhost:6379/0
+DATABASE_URL=postgresql://postgres:example@localhost:5432/postgres
+PRED_API=http://localhost:8000
+EOF
+
+mkdir -p "$REPO_DIR/pred_service/model"
+cat > "$REPO_DIR/pred_service/app.py" <<'PY'
+from fastapi import FastAPI, HTTPException
+import os, json, time
+import redis, joblib, numpy as np
+
+app = FastAPI()
+r = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "model")
+PRE_MATCH_ARTIFACT = os.path.join(MODEL_DIR, "pre_match_artifact.pkl")
+INPLAY_ARTIFACT = os.path.join(MODEL_DIR, "inplay_models.pkl")
+
+pre_match_artifact = None
+inplay_models = None
+try:
+    if os.path.exists(PRE_MATCH_ARTIFACT):
+        pre_match_artifact = joblib.load(PRE_MATCH_ARTIFACT)
+except Exception:
+    pre_match_artifact = None
+
+try:
+    if os.path.exists(INPLAY_ARTIFACT):
+        inplay_models = joblib.load(INPLAY_ARTIFACT)
+except Exception:
+    inplay_models = None
+
+def naive_probs(home: str, away: str):
+    h = 1.0 + (abs(hash(home)) % 100) / 100.0
+    a = 1.0 + (abs(hash(away)) % 100) / 100.0
+    ph = h / (h + a)
+    pa = a / (h + a)
+    pd = max(0.04, 1.0 - (ph + pa))
+    return ph, pd, pa
+
+@app.get("/pre-match")
+def pre_match():
+    raw = r.get("odds:latest")
+    if not raw:
+        raise HTTPException(status_code=404, detail="No odds available")
+    blob = json.loads(raw)
+    matches = blob.get("data", {}).get("matches", [])
+    results = []
+    for m in matches:
+        home = m.get("home")
+        away = m.get("away")
+        if pre_match_artifact:
+            try:
+                ph, pd, pa = pre_match_artifact["predict_fn"](home, away)
+            except Exception:
+                ph, pd, pa = naive_probs(home, away)
+        else:
+            ph, pd, pa = naive_probs(home, away)
+        market = m.get("markets", {}).get("1x2", {})
+        b_home = float(market.get("home_odds", 2.5))
+        b_draw = float(market.get("draw_odds", 3.2))
+        b_away = float(market.get("away_odds", 2.8))
+        edges = [
+            {"side": "Home", "model_prob": ph, "book_odds": b_home, "edge": ph - 1.0 / b_home},
+            {"side": "Draw", "model_prob": pd, "book_odds": b_draw, "edge": pd - 1.0 / b_draw},
+            {"side": "Away", "model_prob": pa, "book_odds": b_away, "edge": pa - 1.0 / b_away},
+        ]
+        best = max(edges, key=lambda x: x["edge"])
+        results.append({
+            "match_id": m.get("match_id"),
+            "match": f"{home} vs {away}",
+            "model_probs": {"home": ph, "draw": pd, "away": pa},
+            "best_market": best
+        })
+    return {"results": results, "ts": time.time()}
+
+@app.get("/match/{match_id}")
+def match(match_id: str, sims: int = 1000):
+    ekey = f"match:events:{match_id}"
+    events = r.lrange(ekey, 0, -1)
+    if not events:
+        raise HTTPException(status_code=404, detail="No events for match")
+    score = {"home": 0, "away": 0}
+    minute = 1
+    home_team = None
+    away_team = None
+    for raw in events:
+        try:
+            j = json.loads(raw)
+        except Exception:
+            continue
+        ev = j.get("event", {})
+        home_team = j.get("home") or home_team
+        away_team = j.get("away") or away_team
+        if ev.get("type") == "goal":
+            if ev.get("team") == "home":
+                score["home"] += 1
+            elif ev.get("team") == "away":
+                score["away"] += 1
+        if ev.get("minute"):
+            minute = max(minute, int(ev.get("minute")))
+    if pre_match_artifact and home_team and away_team:
+        try:
+            ph0, pd0, pa0 = pre_match_artifact["predict_fn"](home_team, away_team)
+        except Exception:
+            ph0, pd0, pa0 = naive_probs(home_team or "home", away_team or "away")
+    else:
+        ph0, pd0, pa0 = naive_probs(home_team or "home", away_team or "away")
+    if inplay_models:
+        X_curr = [[minute, (abs(hash(home_team)) % 100) - (abs(hash(away_team)) % 100), score["home"] - score["away"], 0, 0]]
+        try:
+            lam_h = float(inplay_models["home"].predict(X_curr)[0])
+            lam_a = float(inplay_models["away"].predict(X_curr)[0])
+        except Exception:
+            lam_h = max(0.01, ph0 * 0.35)
+            lam_a = max(0.01, pa0 * 0.35)
+    else:
+        lam_h = max(0.01, ph0 * 0.35)
+        lam_a = max(0.01, pa0 * 0.35)
+    def simulate_win_prob(lh, la, sh, sa, curr_min, sims_local):
+        rem = max(90 - curr_min, 0)
+        home_w = draw_w = away_w = 0
+        for _ in range(sims_local):
+            gh = np.random.poisson(lh * rem / 45.0)
+            ga = np.random.poisson(la * rem / 45.0)
+            fh = sh + int(gh)
+            fa = sa + int(ga)
+            if fh > fa:
+                home_w += 1
+            elif fa > fh:
+                away_w += 1
+            else:
+                draw_w += 1
+        return home_w / sims_local, draw_w / sims_local, away_w / sims_local
+    ph, pd, pa = simulate_win_prob(lam_h, lam_a, score["home"], score["away"], minute, sims)
+    return {
+        "match_id": match_id,
+        "home_team": home_team,
+        "away_team": away_team,
+        "score": score,
+        "minute": minute,
+        "home_prob": ph,
+        "draw_prob": pd,
+        "away_prob": pa,
+        "lambda": {"home": lam_h, "away": lam_a},
+        "recent_events": [json.loads(x) for x in events[-20:]]
+    }
+PY
+
+mkdir -p "$REPO_DIR/collectors"
+cat > "$REPO_DIR/collectors/mock_feeds.py" <<'PY'
+import json
+from datetime import datetime
+def generate_match(mid):
+    return {
+        "match_id": str(mid),
+        "home": f"Home{mid}",
+        "away": f"Away{mid}",
+        "markets": {"1x2": {"home_odds": 2.5 + mid*0.1, "draw_odds": 3.2, "away_odds": 2.8}},
+        "start_ts": datetime.utcnow().isoformat()
+    }
+def mock_matches():
+    return {"matches": [generate_match(i) for i in range(1,6)]}
+if __name__ == "__main__":
+    print(json.dumps(mock_matches()))
+PY
+
+cat > "$REPO_DIR/collectors/simple_collector.py" <<'PY'
+import os, time, json
+import redis
+from mock_feeds import mock_matches
+
+REDIS_URL = os.getenv("REDIS_URL","redis://localhost:6379/0")
+r = redis.from_url(REDIS_URL)
+ODDS_KEY = "odds:latest"
+EVENTS_KEY_PREFIX = "match:events:"
+
+def loop():
+    while True:
+        m = mock_matches()
+        r.set(ODDS_KEY, json.dumps({"ts":time.time(), "data": m}))
+        for md in m["matches"]:
+            key = EVENTS_KEY_PREFIX + md["match_id"]
+            r.rpush(key, json.dumps({"ts":time.time(), "home": md["home"], "away": md["away"], "event":{"type":"game_start","minute":0}}))
+        time.sleep(5)
+
+if __name__ == "__main__":
+    loop()
+PY
+
+mkdir -p "$REPO_DIR/bot"
+cat > "$REPO_DIR/bot/app.py" <<'PY'
+import os, asyncio, aiohttp, json
+from aiogram import Bot, Dispatcher, executor, types
+import redis
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+PRED_API = os.getenv("PRED_API", "http://pred:8000")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher(bot)
+r = redis.from_url(REDIS_URL)
+
+SUB_KEY_FMT = "subs:match:{}"
+RATE_KEY_FMT = "rl:{}"
+
+def rate_limit(max_per_min=12):
+    def decorator(fn):
+        async def wrapper(message: types.Message):
+            uid = message.from_user.id
+            k = RATE_KEY_FMT.format(uid)
+            cnt = r.incr(k)
+            if cnt == 1:
+                r.expire(k, 60)
+            if int(cnt) > max_per_min:
+                await message.reply("Rate limit exceeded. Try again later.")
+                return
+            await fn(message)
+        return wrapper
+    return decorator
+
+@dp.message_handler(commands=['start','help'])
+async def cmd_start(message: types.Message):
+    await message.reply("Commands: /markets  /match <id>  /subscribe <match_id>  /unsubscribe <match_id>")
+
+@dp.message_handler(commands=['markets'])
+@rate_limit()
+async def cmd_markets(message: types.Message):
+    async with aiohttp.ClientSession() as s:
+        async with s.get(f"{PRED_API}/pre-match") as resp:
+            if resp.status != 200:
+                await message.reply("No market data.")
+                return
+            data = await resp.json()
+    text = ""
+    for m in data.get("results", [])[:8]:
+        bm = m["best_market"]
+        text += f"{m['match']} ({m['match_id']})\n{bm['side']} @ {bm['book_odds']:.2f}  Model {bm['model_prob']*100:.1f}%  Edge {bm['edge']:.3f}\n\n"
+    await message.reply(text or "No value bets right now.")
+
+@dp.message_handler(commands=['match'])
+@rate_limit()
+async def cmd_match(message: types.Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("Usage: /match <match_id>")
+        return
+    mid = parts[1]
+    async with aiohttp.ClientSession() as s:
+        async with s.get(f"{PRED_API}/match/{mid}") as resp:
+            if resp.status != 200:
+                await message.reply("Match not found")
+                return
+            data = await resp.json()
+    text = f"{data.get('home_team','Home')} vs {data.get('away_team','Away')} ({mid})\nScore {data['score']['home']}-{data['score']['away']} Min {data.get('minute',0)}\nHome {data['home_prob']*100:.1f}% Draw {data['draw_prob']*100:.1f}% Away {data['away_prob']*100:.1f}%"
+    await message.reply(text)
+
+@dp.message_handler(commands=['subscribe'])
+@rate_limit()
+async def cmd_subscribe(message: types.Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("Usage: /subscribe <match_id>")
+        return
+    mid = parts[1]
+    k = SUB_KEY_FMT.format(mid)
+    r.sadd(k, message.chat.id)
+    await message.reply(f"Subscribed to match {mid} updates.")
+
+@dp.message_handler(commands=['unsubscribe'])
+@rate_limit()
+async def cmd_unsubscribe(message: types.Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("Usage: /unsubscribe <match_id>")
+        return
+    mid = parts[1]
+    k = SUB_KEY_FMT.format(mid)
+    r.srem(k, message.chat.id)
+    await message.reply(f"Unsubscribed from match {mid}.")
+
+async def notifier():
+    last_scores = {}
+    await bot.delete_webhook(drop_pending_updates=True)
+    import aiohttp
+    while True:
+        try:
+            keys = [k.decode().split(":")[-1] for k in r.keys("subs:match:*")]
+            if not keys:
+                await asyncio.sleep(5)
+                continue
+            async with aiohttp.ClientSession() as s:
+                for mid in keys:
+                    async with s.get(f"{PRED_API}/match/{mid}") as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json()
+                    score_str = f"{data['score']['home']}-{data['score']['away']}"
+                    if last_scores.get(mid) != score_str:
+                        last_scores[mid] = score_str
+                        subs = [int(x) for x in r.smembers(SUB_KEY_FMT.format(mid))]
+                        msg = f"Update {mid}: {data.get('home_team','Home')} {data['score']['home']} - {data['score']['away']} {data.get('away_team','Away')}\nMin {data.get('minute',0)}\nH {data['home_prob']*100:.1f}% D {data['draw_prob']*100:.1f}% A {data['away_prob']*100:.1f}%"
+                        for cid in subs:
+                            try:
+                                await bot.send_message(cid, msg)
+                            except Exception:
+                                pass
+            await asyncio.sleep(8)
+        except Exception:
+            await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.create_task(notifier())
+    executor.start_polling(dp, skip_updates=True)
+PY
+
+mkdir -p "$REPO_DIR/model_training"
+cat > "$REPO_DIR/model_training/train_pre_match.py" <<'PY'
+# lightweight pre-match trainer (expects CSVs in ./data)
+import os, joblib, pandas as pd, numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.preprocessing import StandardScaler
+
+DATA_DIR = os.getenv("DATA_DIR", "./data")
+OUT_DIR = os.getenv("OUT_DIR", "../pred_service/model")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+def load_csvs(path):
+    files = [os.path.join(path,f) for f in os.listdir(path) if f.endswith(".csv")]
+    dfs = [pd.read_csv(f) for f in files]
+    return pd.concat(dfs, ignore_index=True)
+
+def engineer(df):
+    df = df.copy()
+    df['result'] = np.where(df['home_goals']>df['away_goals'], 1, np.where(df['away_goals']>df['home_goals'], 2, 0))
+    df['b_home_p'] = 1.0/df['home_odds']
+    df['b_draw_p'] = 1.0/df['draw_odds']
+    df['b_away_p'] = 1.0/df['away_odds']
+    s = df[['b_home_p','b_draw_p','b_away_p']].sum(axis=1)
+    df[['b_home_p','b_draw_p','b_away_p']] = df[['b_home_p','b_draw_p','b_away_p']].div(s, axis=0)
+    df['elo_diff'] = df['home_elo'] - df['away_elo']
+    features = ['elo_diff','b_home_p','b_draw_p','b_away_p']
+    X = df[features].fillna(0.0)
+    y = df['result'].astype(int)
+    return X,y,features
+
+if __name__ == "__main__":
+    df = load_csvs(DATA_DIR)
+    X,y,features = engineer(df)
+    Xtr,Xval,ytr,yval = train_test_split(X,y,test_size=0.2,random_state=42,stratify=y)
+    scaler = StandardScaler().fit(Xtr)
+    Xtr_s = scaler.transform(Xtr)
+    Xval_s = scaler.transform(Xval)
+    clf = GradientBoostingClassifier(n_estimators=200,learning_rate=0.05,max_depth=4)
+    clf.fit(Xtr_s,ytr)
+    cal = CalibratedClassifierCV(base_estimator=clf,method='sigmoid',cv='prefit')
+    cal.fit(Xval_s,yval)
+    artifact = {'model':clf,'calibrator':cal,'scaler':scaler,'features':features}
+    def predict_fn(home,away):
+        home_elo = (abs(hash(home)) % 800) + 1200
+        away_elo = (abs(hash(away)) % 800) + 1200
+        elo_diff = home_elo - away_elo
+        b_home_p = b_draw_p = b_away_p = 1/3
+        import pandas as pd
+        x = pd.DataFrame([[elo_diff,b_home_p,b_draw_p,b_away_p]],columns=features)
+        xs = scaler.transform(x)
+        probs = cal.predict_proba(xs)[0]
+        ph = float(probs[1]); pd = float(probs[0]); pa = float(probs[2])
+        return ph,pd,pa
+    artifact['predict_fn'] = predict_fn
+    out = os.path.join(OUT_DIR,'pre_match_artifact.pkl')
+    joblib.dump(artifact,out)
+    print("Saved",out)
+PY
+
+# create a README
+cat > "$REPO_DIR/README.md" <<'MD'
+# Football bot (demo)
+Populate .env from .env.example, install dependencies, and run the services.
+Local quickstart:
+- Start Redis and Postgres locally
+- Run collectors/simple_collector.py
+- Run pred_service (uvicorn)
+- Run bot/app.py
+MD
+
+# Initialize git
+cd "$REPO_DIR"
+git init >/dev/null
+git add -A
+git commit -m "initial scaffold" >/dev/null
+
+# Create zip
+cd ..
+zip -r "$ZIP_NAME" "$REPO_DIR" >/dev/null
+
+echo "Created $ZIP_NAME in the current directory."
+
+# Heroku steps (optional)
+if [ -n "$HEROKU_APP" ] && [ -n "$HEROKU_API_KEY" ]; then
+  if ! command -v heroku >/dev/null 2>&1; then
+    echo "Heroku CLI not found. Install it and re-run to push to Heroku." >&2
+    exit 1
+  fi
+  echo "Logging into Heroku CLI..."
+  echo "$HEROKU_API_KEY" | heroku auth:token >/dev/null 2>&1 || true
+  heroku git:remote -a "$HEROKU_APP" || heroku create "$HEROKU_APP"
+  git push heroku main --force
+  echo "Pushed to Heroku app: $HEROKU_APP"
+  echo "Remember to set config vars: TELEGRAM_BOT_TOKEN, REDIS_URL, DATABASE_URL"
+fi
+
+echo "Done."
