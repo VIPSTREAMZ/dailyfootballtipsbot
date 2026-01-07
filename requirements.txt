@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+aiogram==2.25.1
+aiohttp
+redis
+psycopg2-binary
+joblib
+numpy
+pandas
+scikit-learn
+python-dotenv
+stripe
+supabase
+pydantic
+pydantic-settings
