@@ -2,6 +2,44 @@
 
 Complete guide for deploying the Football Tips Bot to production.
 
+## Project Structure Overview
+
+The project has a hybrid architecture:
+
+```
+/
+├── package.json              # Root package config (Node.js)
+├── server.js                 # Express server for frontend
+├── requirements.txt          # Python dependencies
+├── Procfile                  # Process definitions
+├── web/                      # React frontend
+│   ├── package.json
+│   ├── src/
+│   │   ├── lib/
+│   │   │   ├── supabase.ts  # Supabase client
+│   │   │   └── api.ts       # API functions
+│   │   └── pages/
+│   └── dist/                 # Built frontend (generated)
+├── pred_service/             # Python prediction API
+├── bot/                      # Telegram bot
+└── collectors/               # Data collectors
+```
+
+## Build Process
+
+The deployment uses **both Node.js and Python**:
+
+1. **Node.js**: Builds the React frontend (`npm run build`)
+   - Compiles TypeScript
+   - Bundles with Vite
+   - Outputs to `web/dist/`
+   - Served via Express server on PORT
+
+2. **Python**: Runs backend services
+   - Prediction API (Flask/FastAPI)
+   - Telegram Bot
+   - Data Collector
+
 ## Pre-Deployment Checklist
 
 - [ ] Supabase project created and configured
@@ -10,6 +48,8 @@ Complete guide for deploying the Football Tips Bot to production.
 - [ ] Redis instance available (or will be provisioned)
 - [ ] Domain name (optional but recommended)
 - [ ] SSL certificate (automatic with most platforms)
+- [ ] Node.js 18+ available on deployment platform
+- [ ] Python 3.10+ available on deployment platform
 
 ## Environment Variables Reference
 
@@ -17,10 +57,15 @@ Complete guide for deploying the Football Tips Bot to production.
 # Telegram
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
 
-# Supabase
+# Supabase (Backend)
 SUPABASE_URL=https://xxxxxxxxxxxxx.supabase.co
 SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+
+# Supabase (Frontend - required for React build)
+VITE_SUPABASE_URL=https://xxxxxxxxxxxxx.supabase.co
+VITE_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+VITE_API_URL=https://your-domain.com
 
 # Redis
 REDIS_URL=redis://user:password@host:port/0
@@ -32,7 +77,12 @@ STRIPE_WEBHOOK_SECRET=whsec_xxxxxxxxxxxxx
 # Application URLs
 FRONTEND_URL=https://your-domain.com
 PRED_API=https://your-domain.com
+
+# Server Port (Node.js)
+PORT=3000
 ```
+
+**Important**: The `VITE_*` variables must be set before running `npm run build` as they are embedded into the frontend bundle during build time.
 
 ## Platform-Specific Deployments
 
