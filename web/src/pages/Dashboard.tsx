@@ -3,8 +3,9 @@ import { useNavigate } from 'react-router-dom';
 import { useEffect, useState } from 'react';
 import { supabase } from '../lib/supabase';
 import { getPreMatchPredictions } from '../lib/api';
+import type { Session } from '@supabase/supabase-js';
 
-export default function Dashboard({ session }: { session: any }) {
+export default function Dashboard({ session }: { session: Session | null }) {
   const navigate = useNavigate();
   const [subscription, setSubscription] = useState<any>(null);
   const [loadingSub, setLoadingSub] = useState(true);

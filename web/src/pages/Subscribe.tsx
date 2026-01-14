@@ -2,8 +2,9 @@ import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { getPlans, createCheckoutSession } from '../lib/api';
 import { useNavigate } from 'react-router-dom';
+import type { Session } from '@supabase/supabase-js';
 
-export default function Subscribe({ session }: { session: any }) {
+export default function Subscribe({ session }: { session: Session | null }) {
   const navigate = useNavigate();
   const [loading, setLoading] = useState<string | null>(null);
 
